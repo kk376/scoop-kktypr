@@ -1,0 +1,21 @@
+{
+    "version": "0.1.1",
+    "description": "Terminal touch typing academy and developer code syntax trainer in pure Rust",
+    "homepage": "https://github.com/kk376/kktypr",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/kk376/kktypr/releases/download/v0.1.1/kktypr-windows-x86_64.zip",
+            "hash": "da71d3177546d5c767828a6545603b3c0096580fc867d0542f1e697fb5135555"
+        }
+    },
+    "bin": "kktypr.exe",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/kk376/kktypr/releases/download/v$version/kktypr-windows-x86_64.zip"
+            }
+        }
+    }
+}

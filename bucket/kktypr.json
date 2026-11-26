@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/kk376/kktypr/releases/download/v0.2.0/kktypr-windows-x86_64.zip",
-            "hash": "ac870197f44b2d8d765c1c73642468c609db4ab59dbab01ec7314e313c41b129"
+            "hash": "100d631f09152926f27ce1591db968cf4b35856581fcd36bdae4a7f3f1b632fa"
         }
     },
     "bin": "kktypr.exe",
@@ -14,7 +14,10 @@
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/kk376/kktypr/releases/download/v$version/kktypr-windows-x86_64.zip"
+                "url": "https://github.com/kk376/kktypr/releases/download/v$version/kktypr-windows-x86_64.zip",
+                "hash": {
+                    "url": "$baseurl/SHA256SUMS.txt"
+                }
             }
         }
     }

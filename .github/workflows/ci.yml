@@ -1,0 +1,266 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-manifests:
+    name: Validate Manifests & Asset Hashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate bucket JSON, live SHA-256 hashes, and archive binaries
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+          import zipfile
+
+          HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+          REQUIRED_KEYS = (
+              "version",
+              "description",
+              "homepage",
+              "license",
+              "bin",
+              "checkver",
+              "autoupdate",
+          )
+
+          def as_list(val):
+              if val is None:
+                  return []
+              return val if isinstance(val, list) else [val]
+
+          def download(url, dest):
+              if not url.startswith("https://"):
+                  raise SystemExit(f"Non-HTTPS URL rejected: {url}")
+              subprocess.run(
+                  ["curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "-o", str(dest), url],
+                  check=True,
+              )
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def expected_bins(bin_field, extract_dirs):
+              items = bin_field if isinstance(bin_field, list) else [bin_field]
+              targets = []
+              for item in items:
+                  target = item[0] if isinstance(item, list) else item
+                  targets.append(target.replace("\\", "/").lstrip("./"))
+              if not extract_dirs:
+                  return targets
+              prefixed = []
+              for prefix in extract_dirs:
+                  p = prefix.strip("/\\").replace("\\", "/")
+                  for t in targets:
+                      prefixed.append(f"{p}/{t}" if p else t)
+              return prefixed
+
+          def verify_archive_bins(archive_path, url, bins):
+              lower = url.lower().split("?", 1)[0]
+              if lower.endswith(".zip"):
+                  with zipfile.ZipFile(archive_path) as zf:
+                      names = {n.replace("\\", "/").lstrip("./") for n in zf.namelist()}
+              elif lower.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")):
+                  with tarfile.open(archive_path) as tf:
+                      names = {m.name.replace("\\", "/").lstrip("./") for m in tf.getmembers()}
+              else:
+                  raise SystemExit(f"Unsupported archive type for bin verification: {url}")
+
+              for b in bins:
+                  if b not in names:
+                      raise SystemExit(f"Declared binary '{b}' not found in {url}; entries={sorted(names)[:20]}")
+
+          def verify_hash_url(hash_url, filename, expected_sha, tmpdir, cache):
+              if hash_url not in cache:
+                  hp = tmpdir / f"checksums_{len(cache)}.txt"
+                  download(hash_url, hp)
+                  cache[hash_url] = hp.read_text(encoding="utf-8", errors="replace")
+              text = cache[hash_url]
+              matched = False
+              for raw_line in text.splitlines():
+                  parts = raw_line.strip().split()
+                  if len(parts) >= 2 and parts[1].lstrip("*./") == filename:
+                      if parts[0].lower() != expected_sha:
+                          raise SystemExit(
+                              f"{hash_url} hash mismatch for {filename}: expected {expected_sha}, got {parts[0]}"
+                          )
+                      matched = True
+                      break
+              if not matched:
+                  raise SystemExit(f"Entry '{filename}' not found in {hash_url}")
+
+          manifests = sorted(pathlib.Path("bucket").glob("*.json"))
+          if not manifests:
+              raise SystemExit("No bucket/*.json manifests found")
+
+          checksum_cache = {}
+          with tempfile.TemporaryDirectory() as tmp:
+              tmpdir = pathlib.Path(tmp)
+              for manifest_path in manifests:
+                  raw = manifest_path.read_bytes()
+                  if raw.startswith(b"\xef\xbb\xbf"):
+                      raise SystemExit(f"{manifest_path}: UTF-8 BOM is not allowed")
+                  text = raw.decode("utf-8")
+                  if "\t" in text:
+                      raise SystemExit(f"{manifest_path}: tabs are not allowed; use 4-space indent")
+                  data = json.loads(text)
+
+                  for key in REQUIRED_KEYS:
+                      if key not in data or not data[key]:
+                          raise SystemExit(f"{manifest_path}: missing required field '{key}'")
+
+                  version = str(data["version"])
+                  homepage = str(data["homepage"])
+                  if not homepage.startswith("https://"):
+                      raise SystemExit(f"{manifest_path}: homepage must use https://")
+                  subprocess.run(
+                      ["curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "-o", "/dev/null", homepage],
+                      check=True,
+                  )
+
+                  targets = []
+                  if "url" in data or "hash" in data:
+                      targets.append(("default", data.get("url"), data.get("hash"), as_list(data.get("extract_dir"))))
+                  for arch, spec in (data.get("architecture") or {}).items():
+                      targets.append((arch, spec.get("url"), spec.get("hash"), as_list(spec.get("extract_dir"))))
+                  if not targets:
+                      raise SystemExit(f"{manifest_path}: no url/hash definitions found")
+
+                  manifest_urls = {}
+                  manifest_hashes = {}
+                  for label, raw_urls, raw_hashes, extract_dirs in targets:
+                      urls = as_list(raw_urls)
+                      hashes = as_list(raw_hashes)
+                      if not urls or len(urls) != len(hashes):
+                          raise SystemExit(f"{manifest_path} [{label}]: mismatched url/hash entries")
+                      for idx, (url, digest) in enumerate(zip(urls, hashes)):
+                          clean_hash = str(digest).lower().removeprefix("sha256:")
+                          if not HEX64_RE.fullmatch(clean_hash):
+                              raise SystemExit(f"{manifest_path} [{label}]: expected 64-hex sha256, got '{digest}'")
+                          artifact = tmpdir / f"{manifest_path.stem}_{label}_{idx}_{url.rsplit('/', 1)[-1]}"
+                          print(f"Downloading {url} ...")
+                          download(url, artifact)
+                          actual = sha256_file(artifact)
+                          if actual != clean_hash:
+                              raise SystemExit(
+                                  f"{manifest_path} [{label}]: SHA-256 mismatch for {url}! manifest={clean_hash} actual={actual}"
+                              )
+                          print(f"OK SHA-256 {label}: {actual}")
+                          if idx == 0:
+                              verify_archive_bins(artifact, url, expected_bins(data["bin"], extract_dirs))
+                              print(f"OK archive bin check {label}: {data['bin']}")
+                          manifest_urls.setdefault(label, []).append(url)
+                          manifest_hashes.setdefault(label, []).append(clean_hash)
+
+                  auto = data["autoupdate"]
+                  auto_targets = []
+                  if "url" in auto:
+                      auto_targets.append(("default", auto))
+                  for arch, spec in (auto.get("architecture") or {}).items():
+                      auto_targets.append((arch, spec))
+                  if not auto_targets:
+                      raise SystemExit(f"{manifest_path}: autoupdate must define url or architecture entries")
+
+                  for label, spec in auto_targets:
+                      a_urls = as_list(spec.get("url"))
+                      if not a_urls:
+                          raise SystemExit(f"{manifest_path} autoupdate[{label}]: missing url")
+                      h_spec = spec.get("hash")
+                      if not h_spec:
+                          raise SystemExit(f"{manifest_path} autoupdate[{label}]: missing hash configuration")
+                      h_specs = h_spec if isinstance(h_spec, list) else [h_spec]
+                      for idx, (tmpl_url, hs) in enumerate(zip(a_urls, h_specs)):
+                          resolved_url = tmpl_url.replace("$version", version)
+                          if label in manifest_urls and resolved_url != manifest_urls[label][idx]:
+                              raise SystemExit(
+                                  f"{manifest_path} autoupdate[{label}]: URL mismatch '{resolved_url}' != '{manifest_urls[label][idx]}'"
+                              )
+                          if isinstance(hs, dict) and hs.get("url"):
+                              baseurl = resolved_url.rsplit("/", 1)[0]
+                              resolved_hash_url = hs["url"].replace("$baseurl", baseurl).replace("$version", version)
+                              filename = resolved_url.rsplit("/", 1)[-1]
+                              verify_hash_url(
+                                  resolved_hash_url,
+                                  filename,
+                                  manifest_hashes[label][idx],
+                                  tmpdir,
+                                  checksum_cache,
+                              )
+                              print(f"OK autoupdate checksum verification [{label}]: {resolved_hash_url}")
+          PY
+
+  scoop-install-test:
+    name: Windows Scoop Install & Run Test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bootstrap Scoop if needed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'install.ps1'
+            Invoke-RestMethod -Uri 'https://get.scoop.sh' -OutFile $installer
+            & $installer -RunAsAdmin
+          }
+          $shimsDir = Join-Path $env:USERPROFILE 'scoop\shims'
+          if (Test-Path $shimsDir) {
+            $shimsDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Install, verify shim output, and uninstall manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifests = Get-ChildItem -Path 'bucket\*.json'
+          if (-not $manifests) { throw 'No bucket/*.json manifests found' }
+          foreach ($file in $manifests) {
+            $app = $file.BaseName
+            $manifest = Get-Content -Path $file.FullName -Raw | ConvertFrom-Json
+            Write-Host "::group::Installing $app ($($manifest.version))"
+            scoop install $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "scoop install failed for $app" }
+            $binItems = @($manifest.bin)
+            $firstBin = if ($binItems[0] -is [System.Array]) { $binItems[0][1] } else { $binItems[0] }
+            $cmdName = [System.IO.Path]::GetFileNameWithoutExtension($firstBin)
+            $versionOutput = (& $cmdName --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw "'$cmdName --version' exited with code $LASTEXITCODE" }
+            Write-Host "$cmdName --version => $versionOutput"
+            if ($versionOutput -notmatch [regex]::Escape($manifest.version)) {
+              throw "Expected version '$($manifest.version)' in '$versionOutput'"
+            }
+            scoop uninstall $app
+            if ($LASTEXITCODE -ne 0) { throw "scoop uninstall failed for $app" }
+            Write-Host "::endgroup::"
+          }
